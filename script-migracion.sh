@@ -628,6 +628,98 @@ migrate_group_members() {
     return 0
 }
 
+# Función para migrar namespaces
+migrate_namespaces() {
+    log "INFO" "Migrando namespaces al servidor destino..."
+    
+    local imported=0
+    local failed=0
+    local skipped=0
+    
+    # Obtener todos los namespaces del origen
+    local namespaces_file="${EXPORT_DIR}/source_namespaces.json"
+    if ! get_all_paginated "${SOURCE_IP}" "${SOURCE_TOKEN}" "namespaces" "${namespaces_file}"; then
+        log "ERROR" "Fallo al obtener namespaces del origen"
+        return 1
+    fi
+    
+    local namespace_count=$(jq 'length' "${namespaces_file}")
+    log "INFO" "Encontrados ${namespace_count} namespaces en origen"
+    
+    # Obtener namespaces existentes en destino
+    local existing_namespaces_file="${EXPORT_DIR}/existing_namespaces.json"
+    if ! get_all_paginated "${DEST_IP}" "${DEST_TOKEN}" "namespaces" "${existing_namespaces_file}"; then
+        log "ERROR" "No se pudo obtener lista de namespaces existentes en destino"
+        return 1
+    fi
+    
+    # Ordenar namespaces por nivel de anidación (namespaces padre primero)
+    local sorted_namespaces=$(jq 'sort_by(.full_path | split("/") | length)' "${namespaces_file}")
+    
+    echo "${sorted_namespaces}" | jq -c '.[]' | while IFS= read -r namespace; do
+        local id=$(echo "${namespace}" | jq -r '.id')
+        local name=$(echo "${namespace}" | jq -r '.name')
+        local path=$(echo "${namespace}" | jq -r '.path')
+        local kind=$(echo "${namespace}" | jq -r '.kind')
+        local full_path=$(echo "${namespace}" | jq -r '.full_path')
+        local parent_id=$(echo "${namespace}" | jq -r '.parent_id // ""')
+        
+        # Verificar si el namespace ya existe
+        local exists=$(jq --arg path "${full_path}" 'any(.[]; .full_path == $path)' "${existing_namespaces_file}")
+        if [[ ${exists} == "true" ]]; then
+            if [[ ${VERBOSE} -eq 1 ]]; then
+                log "INFO" "Namespace ${full_path} ya existe, saltando..."
+            fi
+            ((skipped++))
+            continue
+        fi
+        
+        # Los namespaces pueden ser de tipo 'user' o 'group'
+        # Los namespaces de tipo 'user' se crean automáticamente con los usuarios
+        if [[ ${kind} == "user" ]]; then
+            if [[ ${VERBOSE} -eq 1 ]]; then
+                log "INFO" "Namespace de usuario ${full_path} se creará automáticamente con el usuario"
+            fi
+            ((skipped++))
+            continue
+        fi
+        
+        # Para namespaces de tipo 'group', ya deberían estar creados por import_groups
+        if [[ ${kind} == "group" ]]; then
+            # Verificar si el grupo correspondiente existe
+            local group_exists=$(jq --arg path "${full_path}" 'any(.[]; .full_path == $path)' "${existing_namespaces_file}")
+            if [[ ${group_exists} == "true" ]]; then
+                if [[ ${VERBOSE} -eq 1 ]]; then
+                    log "INFO" "Namespace de grupo ${full_path} ya existe"
+                fi
+                ((skipped++))
+            else
+                log "WARNING" "Namespace de grupo ${full_path} no encontrado. Debería crearse con import_groups"
+                ((failed++))
+            fi
+            continue
+        fi
+        
+        # Para otros tipos de namespace (proyectos, etc.)
+        if [[ ${VERBOSE} -eq 1 ]]; then
+            log "INFO" "Namespace ${full_path} de tipo ${kind} será manejado por la importación de proyectos"
+        fi
+        ((skipped++))
+    done
+    
+    log "INFO" "========== RESUMEN DE MIGRACIÓN DE NAMESPACES =========="
+    log "INFO" "Total namespaces en origen: ${namespace_count}"
+    log "INFO" "Namespaces procesados: ${namespace_count}"
+    log "INFO" "Namespaces que requieren acción manual: ${failed}"
+    log "INFO" "Namespaces manejados automáticamente: ${skipped}"
+    log "INFO" "========================================================"
+    
+    # Actualizar la lista de namespaces en destino para las siguientes fases
+    get_all_paginated "${DEST_IP}" "${DEST_TOKEN}" "namespaces" "${existing_namespaces_file}" >/dev/null 2>&1
+    
+    return 0
+}
+
 # Función para migrar un proyecto individual (exportar e importar inmediatamente)
 migrate_single_project() {
     local project="$1"
@@ -1240,7 +1332,17 @@ main() {
     fi
     
     log "INFO" "=================================================="
-    log "INFO" "INICIANDO FASE 4: MIGRACIÓN DE PROYECTOS"
+    log "INFO" "INICIANDO FASE 4: MIGRACIÓN DE NAMESPACES"
+    log "INFO" "=================================================="
+    
+    if migrate_namespaces; then
+        log "SUCCESS" "Migración de namespaces completada"
+    else
+        log "ERROR" "Falló la migración de namespaces, pero continuando..."
+    fi
+    
+    log "INFO" "=================================================="
+    log "INFO" "INICIANDO FASE 5: MIGRACIÓN DE PROYECTOS"
     log "INFO" "(Exportación e importación secuencial con limpieza automática)"
     log "INFO" "=================================================="
     
@@ -1251,7 +1353,7 @@ main() {
     fi
     
     log "INFO" "=================================================="
-    log "INFO" "INICIANDO FASE 5: VERIFICACIÓN FINAL"
+    log "INFO" "INICIANDO FASE 6: VERIFICACIÓN FINAL"
     log "INFO" "=================================================="
     
     if check_import_status; then
