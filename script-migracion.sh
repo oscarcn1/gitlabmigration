@@ -850,9 +850,23 @@ import_single_project() {
         fi
     fi
     
-    # Si aún no se encuentra namespace, usar el del usuario actual
+    # Si aún no se encuentra namespace, obtener el namespace del usuario actual
     if [[ -z ${namespace_id} ]]; then
-        log "WARNING" "No se encontró namespace ${namespace_full_path}, usando namespace por defecto"
+        log "WARNING" "No se encontró namespace ${namespace_full_path}, obteniendo namespace del usuario actual"
+        local current_user=$(api_call "${DEST_IP}" "${DEST_TOKEN}" "user" 2>/dev/null)
+        if [[ $? -eq 0 ]] && [[ -n ${current_user} ]]; then
+            namespace_id=$(echo "${current_user}" | jq -r '.namespace_id // .id // empty')
+            local username=$(echo "${current_user}" | jq -r '.username // "unknown"')
+            if [[ -n ${namespace_id} ]] && [[ ${namespace_id} != "null" ]]; then
+                log "INFO" "Usando namespace del usuario ${username} (ID: ${namespace_id})"
+            else
+                log "ERROR" "No se pudo obtener namespace válido para importación"
+                return 1
+            fi
+        else
+            log "ERROR" "No se pudo obtener información del usuario actual"
+            return 1
+        fi
     fi
     
     # Verificar si el proyecto ya existe
@@ -872,6 +886,18 @@ import_single_project() {
         return 0
     fi
     
+    # Verificar permisos en el namespace antes de importar
+    log "INFO" "Verificando permisos en namespace ${namespace_id}..."
+    local namespace_info=$(api_call "${DEST_IP}" "${DEST_TOKEN}" "namespaces/${namespace_id}" 2>/dev/null)
+    if [[ $? -ne 0 ]] || [[ -z ${namespace_info} ]]; then
+        log "ERROR" "No se puede acceder al namespace ${namespace_id} o no existe"
+        return 1
+    fi
+    
+    # Verificar si el usuario tiene permisos para crear proyectos en este namespace
+    local namespace_kind=$(echo "${namespace_info}" | jq -r '.kind // "user"')
+    log "INFO" "Tipo de namespace: ${namespace_kind}"
+    
     # Pequeña pausa para evitar rate limiting en importación
     sleep 3
     
@@ -888,7 +914,8 @@ import_single_project() {
         fi
     fi
     
-    if [[ -n ${namespace_id} ]]; then
+    # Validar que namespace_id sea válido antes de usarlo
+    if [[ -n ${namespace_id} ]] && [[ ${namespace_id} != "null" ]] && [[ ${namespace_id} =~ ^[0-9]+$ ]]; then
         import_response=$(curl -s --max-time 300 -w '\n__CURL_EXIT_CODE__:%{http_code}' --request POST \
             --header "PRIVATE-TOKEN: ${DEST_TOKEN}" \
             --form "file=@${export_file}" \
@@ -896,11 +923,8 @@ import_single_project() {
             --form "namespace=${namespace_id}" \
             "${PROTOCOL}://${DEST_IP}/api/v4/projects/import")
     else
-        import_response=$(curl -s --max-time 300 -w '\n__CURL_EXIT_CODE__:%{http_code}' --request POST \
-            --header "PRIVATE-TOKEN: ${DEST_TOKEN}" \
-            --form "file=@${export_file}" \
-            --form "path=${path}" \
-            "${PROTOCOL}://${DEST_IP}/api/v4/projects/import")
+        log "ERROR" "Namespace ID inválido (${namespace_id}), no se puede proceder con la importación"
+        return 1
     fi
     
     curl_exit_code=$?
