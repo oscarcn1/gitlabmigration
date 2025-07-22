@@ -818,6 +818,36 @@ export_and_migrate_projects() {
     local namespaces_file="${EXPORT_DIR}/dest_namespaces.json"
     get_all_paginated "${DEST_IP}" "${DEST_TOKEN}" "namespaces" "${namespaces_file}"
     
+    # Verificar que los namespaces necesarios existan
+    log "INFO" "Verificando namespaces necesarios para los proyectos..."
+    local missing_namespaces=0
+    local namespace_map="${EXPORT_DIR}/namespace_mapping.json"
+    echo "{}" > "${namespace_map}"
+    
+    while IFS= read -r project; do
+        local namespace_path=$(echo "${project}" | jq -r '.namespace.full_path // ""')
+        if [[ -n ${namespace_path} ]]; then
+            # Buscar el namespace en destino
+            local dest_ns_id=$(jq -r --arg path "${namespace_path}" \
+                '.[] | select(.full_path == $path) | .id // empty' "${namespaces_file}" 2>/dev/null)
+            
+            if [[ -z ${dest_ns_id} ]]; then
+                log "WARNING" "Namespace no encontrado en destino: ${namespace_path}"
+                ((missing_namespaces++))
+            else
+                # Guardar mapeo para uso posterior
+                jq --arg src "${namespace_path}" --arg dst "${dest_ns_id}" \
+                    '. + {($src): $dst}' "${namespace_map}" > "${namespace_map}.tmp" && \
+                    mv "${namespace_map}.tmp" "${namespace_map}"
+            fi
+        fi
+    done < <(jq -c '.[]' "${PROJECTS_FILE}")
+    
+    if [[ ${missing_namespaces} -gt 0 ]]; then
+        log "WARNING" "Hay ${missing_namespaces} namespaces que no existen en el destino"
+        log "INFO" "Los proyectos sin namespace se importarán al namespace del usuario actual"
+    fi
+    
     local migrated=0
     local failed=0
     local current=0
@@ -921,13 +951,23 @@ import_single_project() {
     # Verificar tamaño del archivo
     local file_size=$(stat -f%z "${export_file}" 2>/dev/null || stat -c%s "${export_file}" 2>/dev/null)
     log "INFO" "Importando proyecto: ${name} (tamaño: ${file_size} bytes)"
+    log "INFO" "Namespace origen: ${namespace_full_path} (tipo: ${namespace_kind})"
     
     # Obtener namespaces en destino
     local namespaces_file="${EXPORT_DIR}/dest_namespaces.json"
+    local namespace_map="${EXPORT_DIR}/namespace_mapping.json"
     
-    # Buscar namespace en destino por full_path
+    # Buscar namespace en destino
     local namespace_id=""
-    if [[ -n ${namespace_full_path} ]]; then
+    
+    # Primero intentar usar el mapeo precalculado si existe
+    if [[ -f ${namespace_map} ]] && [[ -n ${namespace_full_path} ]]; then
+        namespace_id=$(jq -r --arg path "${namespace_full_path}" '.[$path] // empty' "${namespace_map}" 2>/dev/null)
+    fi
+    
+    # Si no está en el mapeo, buscar manualmente
+    if [[ -z ${namespace_id} ]] && [[ -n ${namespace_full_path} ]]; then
+        # Primero intentar buscar por full_path exacto
         namespace_id=$(jq -r --arg path "${namespace_full_path}" \
             '.[] | select(.full_path == $path) | .id // empty' "${namespaces_file}" 2>/dev/null)
         
@@ -937,9 +977,21 @@ import_single_project() {
                 '.[] | select(.path == $path) | .id // empty' "${namespaces_file}" 2>/dev/null)
         fi
         
-        if [[ -n ${namespace_id} ]]; then
-            log "INFO" "Usando namespace: ${namespace_full_path} (ID: ${namespace_id})"
+        # Si aún no se encuentra, intentar buscar solo el último segmento del path
+        if [[ -z ${namespace_id} ]]; then
+            local last_segment=$(echo "${namespace_full_path}" | awk -F'/' '{print $NF}')
+            namespace_id=$(jq -r --arg path "${last_segment}" \
+                '.[] | select(.path == $path) | .id // empty' "${namespaces_file}" 2>/dev/null)
         fi
+        
+        if [[ -n ${namespace_id} ]]; then
+            log "INFO" "Encontrado namespace: ${namespace_full_path} -> ID destino: ${namespace_id}"
+        else
+            log "WARNING" "No se encontró namespace exacto para: ${namespace_full_path}"
+            log "INFO" "Se intentará usar el namespace por defecto del usuario"
+        fi
+    elif [[ -n ${namespace_id} ]]; then
+        log "INFO" "Usando namespace mapeado: ${namespace_full_path} -> ID destino: ${namespace_id}"
     fi
     
     # Si aún no se encuentra namespace, obtener el namespace del usuario actual
